@@ -1,4 +1,9 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  getAgentDir,
+  ModelSelectorComponent,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import { StringEnum, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 import {
@@ -6,13 +11,167 @@ import {
   highestThinkingLevel,
   isRouteName,
   loadConfig,
+  notify,
+  persistConfig,
   resolveRouteState,
   restoreRoute,
   ROUTE_ORDER,
   setStatus,
+  supportedThinkingLevels,
   withConfig,
+  type Config,
   type RouteName,
 } from "../src/mode-core.ts";
+
+async function pickModel(
+  ctx: ExtensionContext,
+  config: Config,
+  routeName: RouteName,
+): Promise<{ provider: string; model: string } | undefined> {
+  const route = resolveRouteState(config, routeName);
+  const currentModel =
+    (route.provider && route.model
+      ? ctx.modelRegistry.find(route.provider, route.model)
+      : undefined) ?? ctx.model;
+  const settingsManager = SettingsManager.create(ctx.cwd, getAgentDir());
+
+  const selected = await ctx.ui.custom<import("@earendil-works/pi-ai").Model<any> | null>(
+    (tui, _theme, _kb, done) =>
+      new ModelSelectorComponent(
+        tui,
+        currentModel,
+        settingsManager,
+        ctx.modelRegistry,
+        [],
+        (model) => done(model),
+        () => done(null),
+      ),
+  );
+
+  return selected ? { provider: selected.provider, model: selected.id } : undefined;
+}
+
+async function pickThinkingLevel(
+  ctx: ExtensionContext,
+  config: Config,
+  routeName: RouteName,
+): Promise<ModelThinkingLevel | undefined> {
+  const route = resolveRouteState(config, routeName);
+  const model =
+    route.provider && route.model
+      ? ctx.modelRegistry.find(route.provider, route.model)
+      : undefined;
+  const current = route.thinkingLevel ?? highestThinkingLevel(model);
+  const levels = [current, ...supportedThinkingLevels(model).filter((level) => level !== current)];
+  const labels = levels.map((level) => (level === current ? `${level} [current]` : level));
+  const selected = await ctx.ui.select(`Thinking for ${routeName}`, labels);
+  return selected ? levels[labels.indexOf(selected)] : undefined;
+}
+
+async function showRouteSelector(
+  ctx: ExtensionContext,
+  pi: ExtensionAPI,
+  config: Config,
+): Promise<void> {
+  let selectedIndex = Math.max(
+    0,
+    ROUTE_ORDER.indexOf(config.routing?.activeRoute ?? "vision"),
+  );
+
+  while (true) {
+    const result = await ctx.ui.custom<{
+      action: "confirm" | "thinking" | "model" | "toggle" | "cancel";
+      routeName: RouteName;
+    }>((tui, theme, _kb, done) => ({
+      render(_width: number) {
+        const enabled = config.routing?.enabled ?? false;
+        const lines: string[] = [
+          theme.fg("accent", theme.bold(`Routing · ${enabled ? "on" : "off"}`)),
+        ];
+        for (const [index, name] of ROUTE_ORDER.entries()) {
+          const route = resolveRouteState(config, name);
+          const configured =
+            route.provider && route.model
+              ? `${route.provider}/${route.model}`
+              : "unconfigured";
+          const thinking = route.thinkingLevel ? ` · thinking:${route.thinkingLevel}` : "";
+          const line = `${index === selectedIndex ? "→ " : "  "}${name} — ${configured}${thinking}${
+            name === config.routing?.activeRoute ? " [active]" : ""
+          }`;
+          lines.push(index === selectedIndex ? theme.fg("accent", line) : line);
+        }
+        lines.push(
+          theme.fg(
+            "dim",
+            "↑↓/j/k choose • Enter apply • t thinking • c model • e toggle • Esc cancel",
+          ),
+        );
+        return lines;
+      },
+      invalidate() {},
+      handleInput(data: string) {
+        const routeName = ROUTE_ORDER[selectedIndex];
+        if (data === "\r" || data === "\n") done({ action: "confirm", routeName });
+        else if (data === "t" || data === "T") done({ action: "thinking", routeName });
+        else if (data === "c" || data === "C") done({ action: "model", routeName });
+        else if (data === "e" || data === "E") done({ action: "toggle", routeName });
+        else if (data === "\u001b[A" || data === "k") {
+          selectedIndex = (selectedIndex - 1 + ROUTE_ORDER.length) % ROUTE_ORDER.length;
+          tui.requestRender();
+        } else if (data === "\u001b[B" || data === "j") {
+          selectedIndex = (selectedIndex + 1) % ROUTE_ORDER.length;
+          tui.requestRender();
+        } else if (data === "\u001b" || data.startsWith("\u001b")) {
+          done({ action: "cancel", routeName });
+        }
+      },
+    }));
+
+    if (!result || result.action === "cancel") return;
+    selectedIndex = ROUTE_ORDER.indexOf(result.routeName);
+
+    if (result.action === "toggle") {
+      config.routing ??= {};
+      config.routing.enabled = !(config.routing.enabled ?? false);
+      persistConfig(ctx, config);
+      notify(ctx, `Task routing ${config.routing.enabled ? "enabled" : "disabled"}`, "info");
+    } else if (result.action === "thinking") {
+      const level = await pickThinkingLevel(ctx, config, result.routeName);
+      if (level) {
+        config.routing ??= {};
+        config.routing.routes ??= {};
+        config.routing.routes[result.routeName] = {
+          ...config.routing.routes[result.routeName],
+          thinkingLevel: level,
+        };
+        persistConfig(ctx, config);
+      }
+    } else if (result.action === "model") {
+      const model = await pickModel(ctx, config, result.routeName);
+      if (model) {
+        config.routing ??= {};
+        config.routing.routes ??= {};
+        config.routing.routes[result.routeName] = {
+          ...config.routing.routes[result.routeName],
+          provider: model.provider,
+          model: model.model,
+        };
+        persistConfig(ctx, config);
+      }
+    } else {
+      const ok = await applyRoute(ctx, pi, config, result.routeName);
+      if (!ok) {
+        notify(
+          ctx,
+          `Route "${result.routeName}" is not configured or routing is disabled.`,
+          "error",
+        );
+        continue;
+      }
+      return;
+    }
+  }
+}
 
 export default function routingExtension(pi: ExtensionAPI) {
   let config = loadConfig();
@@ -40,6 +199,48 @@ export default function routingExtension(pi: ExtensionAPI) {
       "route",
       config.routing?.activeRoute ? `route:${config.routing.activeRoute}` : undefined,
     );
+  });
+
+  pi.registerCommand("routing", {
+    description: "Select or configure task routes",
+    getArgumentCompletions: (prefix) => {
+      const trimmed = prefix.trimStart();
+      const [first = ""] = trimmed.split(/\s+/);
+      return ["on", "off"]
+        .filter((name) => name.startsWith(first))
+        .map((name) => ({ value: name, label: name }));
+    },
+    handler: async (args, ctx) => {
+      config = withConfig(ctx);
+      const arg = args.trim();
+
+      if (arg === "on") {
+        config.routing ??= {};
+        config.routing.enabled = true;
+        persistConfig(ctx, config);
+        notify(ctx, "Task routing enabled", "info");
+        return;
+      }
+
+      if (arg === "off") {
+        config.routing ??= {};
+        config.routing.enabled = false;
+        persistConfig(ctx, config);
+        notify(ctx, "Task routing disabled", "info");
+        return;
+      }
+
+      if (arg) {
+        notify(
+          ctx,
+          `Unknown argument "${arg}". Use: on, off, or no argument for the selector.`,
+          "error",
+        );
+        return;
+      }
+
+      await showRouteSelector(ctx, pi, config);
+    },
   });
 
   pi.registerTool({

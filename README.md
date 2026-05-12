@@ -25,6 +25,27 @@ Routes are meant to be temporary. Use `task_model` with `action='switch'` only w
 
 Inline one-shot delegation is intentionally not implemented here; use prompt-template/subagent extensions such as `pi-prompt-template-model` for that workflow.
 
+## Commands
+
+### `/routing`
+
+Opens the interactive route selector.
+
+```
+/routing       # open selector UI
+/routing on    # enable task routing
+/routing off   # disable task routing
+```
+
+Inside the selector:
+
+- `↑↓` / `j` / `k` — navigate routes
+- `Enter` — switch session to selected route
+- `c` — change model for selected route
+- `t` — change thinking level for selected route
+- `e` — toggle routing on/off
+- `Esc` — cancel
+
 ## Tools (for the agent)
 
 ### `task_model`
