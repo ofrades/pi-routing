@@ -1,6 +1,6 @@
 # pi-routing
 
-Lightweight named route switching for [Pi](https://github.com/badlogic/pi-mono).
+Experimental lightweight named route switching for [Pi](https://github.com/earendil-works/pi) trying something like [amp](https://ampcode.com/models) subagents and system models but for cheaper runs.
 
 ## Installation
 
