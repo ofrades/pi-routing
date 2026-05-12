@@ -1,0 +1,51 @@
+{
+  "name": "pi-routing",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Lightweight named route switching for pi.",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "routing",
+    "model-switching",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "author": "ofrades",
+  "homepage": "https://github.com/ofrades/pi-routing#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ofrades/pi-routing.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ofrades/pi-routing/issues"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/pi-routing.ts"
+    ]
+  },
+  "files": [
+    "extensions",
+    "src",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.7.0",
+    "typescript": "^6.0.3"
+  }
+}
