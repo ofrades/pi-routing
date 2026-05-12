@@ -68,14 +68,12 @@ Config is stored in `settings.json` under the agent directory:
 
 ```json
 {
-  "mode": {
-    "routing": {
-      "enabled": true,
-      "routes": {
-        "vision":    { "provider": "google",    "model": "gemini-2.0-flash" },
-        "librarian": { "provider": "anthropic", "model": "claude-sonnet-4-6" },
-        "oracle":    { "provider": "openai",    "model": "o3" }
-      }
+  "routing": {
+    "enabled": true,
+    "routes": {
+      "vision":    { "provider": "google",    "model": "gemini-2.0-flash" },
+      "librarian": { "provider": "anthropic", "model": "claude-sonnet-4-6" },
+      "oracle":    { "provider": "openai",    "model": "o3" }
     }
   }
 }

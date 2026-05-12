@@ -75,7 +75,7 @@ async function showRouteSelector(
 ): Promise<void> {
   let selectedIndex = Math.max(
     0,
-    ROUTE_ORDER.indexOf(config.routing?.activeRoute ?? "vision"),
+    ROUTE_ORDER.indexOf(config.activeRoute ?? "vision"),
   );
 
   while (true) {
@@ -84,7 +84,7 @@ async function showRouteSelector(
       routeName: RouteName;
     }>((tui, theme, _kb, done) => ({
       render(_width: number) {
-        const enabled = config.routing?.enabled ?? false;
+        const enabled = config.enabled ?? false;
         const lines: string[] = [
           theme.fg("accent", theme.bold(`Routing · ${enabled ? "on" : "off"}`)),
         ];
@@ -96,7 +96,7 @@ async function showRouteSelector(
               : "unconfigured";
           const thinking = route.thinkingLevel ? ` · thinking:${route.thinkingLevel}` : "";
           const line = `${index === selectedIndex ? "→ " : "  "}${name} — ${configured}${thinking}${
-            name === config.routing?.activeRoute ? " [active]" : ""
+            name === config.activeRoute ? " [active]" : ""
           }`;
           lines.push(index === selectedIndex ? theme.fg("accent", line) : line);
         }
@@ -131,17 +131,15 @@ async function showRouteSelector(
     selectedIndex = ROUTE_ORDER.indexOf(result.routeName);
 
     if (result.action === "toggle") {
-      config.routing ??= {};
-      config.routing.enabled = !(config.routing.enabled ?? false);
+      config.enabled = !(config.enabled ?? false);
       persistConfig(ctx, config);
-      notify(ctx, `Task routing ${config.routing.enabled ? "enabled" : "disabled"}`, "info");
+      notify(ctx, `Task routing ${config.enabled ? "enabled" : "disabled"}`, "info");
     } else if (result.action === "thinking") {
       const level = await pickThinkingLevel(ctx, config, result.routeName);
       if (level) {
-        config.routing ??= {};
-        config.routing.routes ??= {};
-        config.routing.routes[result.routeName] = {
-          ...config.routing.routes[result.routeName],
+        config.routes ??= {};
+        config.routes[result.routeName] = {
+          ...config.routes[result.routeName],
           thinkingLevel: level,
         };
         persistConfig(ctx, config);
@@ -149,10 +147,9 @@ async function showRouteSelector(
     } else if (result.action === "model") {
       const model = await pickModel(ctx, config, result.routeName);
       if (model) {
-        config.routing ??= {};
-        config.routing.routes ??= {};
-        config.routing.routes[result.routeName] = {
-          ...config.routing.routes[result.routeName],
+        config.routes ??= {};
+        config.routes[result.routeName] = {
+          ...config.routes[result.routeName],
           provider: model.provider,
           model: model.model,
         };
@@ -197,7 +194,7 @@ export default function routingExtension(pi: ExtensionAPI) {
     setStatus(
       ctx,
       "route",
-      config.routing?.activeRoute ? `route:${config.routing.activeRoute}` : undefined,
+      config.activeRoute ? `route:${config.activeRoute}` : undefined,
     );
   });
 
@@ -215,16 +212,14 @@ export default function routingExtension(pi: ExtensionAPI) {
       const arg = args.trim();
 
       if (arg === "on") {
-        config.routing ??= {};
-        config.routing.enabled = true;
+        config.enabled = true;
         persistConfig(ctx, config);
         notify(ctx, "Task routing enabled", "info");
         return;
       }
 
       if (arg === "off") {
-        config.routing ??= {};
-        config.routing.enabled = false;
+        config.enabled = false;
         persistConfig(ctx, config);
         notify(ctx, "Task routing disabled", "info");
         return;
@@ -261,7 +256,7 @@ export default function routingExtension(pi: ExtensionAPI) {
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       config = withConfig(ctx);
-      const routingEnabled = config.routing?.enabled !== false;
+      const routingEnabled = config.enabled !== false;
 
       if (params.action === "status") {
         return {
@@ -269,7 +264,7 @@ export default function routingExtension(pi: ExtensionAPI) {
             {
               type: "text",
               text: `Task routing is ${routingEnabled ? "enabled" : "disabled"}.${
-                config.routing?.activeRoute ? ` Active route: ${config.routing.activeRoute}.` : ""
+                config.activeRoute ? ` Active route: ${config.activeRoute}.` : ""
               }`,
             },
           ],
@@ -304,7 +299,7 @@ export default function routingExtension(pi: ExtensionAPI) {
       }
 
       if (params.action === "restore") {
-        const previous = config.routing?.previous;
+        const previous = config.previous;
         const ok = await restoreRoute(ctx, pi, config);
         if (!ok) throw new Error("Could not restore previous/main model.");
         pendingModelReassert =

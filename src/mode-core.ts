@@ -40,16 +40,14 @@ export type TurnEntry = {
 };
 
 export type Config = {
-  routing?: {
-    enabled?: boolean;
-    activeRoute?: RouteName;
-    previous?: {
-      provider?: string;
-      model?: string;
-      thinkingLevel?: ModelThinkingLevel;
-    };
-    routes?: Partial<Record<RouteName, Partial<RouteState>>>;
+  enabled?: boolean;
+  activeRoute?: RouteName;
+  previous?: {
+    provider?: string;
+    model?: string;
+    thinkingLevel?: ModelThinkingLevel;
   };
+  routes?: Partial<Record<RouteName, Partial<RouteState>>>;
 };
 
 export const ROUTE_ORDER: RouteName[] = ["vision", "handoff", "search", "review", "oracle", "librarian"];
@@ -128,9 +126,7 @@ function saveConfig(config: Config) {
     throw new Error(`Refusing to overwrite unreadable settings.json: ${settingsReadError}`);
   }
 
-  const existing = (settings.mode ?? {}) as Config;
-  settings.mode = { ...existing, routing: config.routing };
-  delete settings.modelMode;
+  settings.routing = config;
   writeFileSync(SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`);
 }
 
@@ -151,7 +147,7 @@ export function costLabel(cost: number): string {
 }
 
 export function activeCostBucket(config: Config): string {
-  return config.routing?.activeRoute ?? "custom";
+  return config.activeRoute ?? "custom";
 }
 
 export function appendCostEntry(entry: CostEntry): void {
@@ -235,7 +231,7 @@ export function summarizeCosts(entries: CostEntry[]): string {
 
 export function loadConfig(): Config {
   const settings = readSettings();
-  const config = settings.mode ?? settings.modelMode;
+  const config = settings.routing;
   return config && typeof config === "object" ? (config as Config) : {};
 }
 
@@ -272,7 +268,7 @@ export function highestThinkingLevel(model: unknown): ModelThinkingLevel {
 
 export function resolveRouteState(config: Config, routeName: RouteName): RouteState {
   const meta = ROUTE_METADATA[routeName];
-  const route = config.routing?.routes?.[routeName];
+  const route = config.routes?.[routeName];
   return {
     provider: route?.provider,
     model: route?.model,
@@ -284,17 +280,16 @@ export function resolveRouteState(config: Config, routeName: RouteName): RouteSt
 }
 
 function ensureRoutingDefaults(ctx: ExtensionContext, config: Config) {
-  config.routing ??= {};
-  if (config.routing.activeRoute && !isRouteName(config.routing.activeRoute)) {
-    delete config.routing.activeRoute;
+  if (config.activeRoute && !isRouteName(config.activeRoute)) {
+    delete config.activeRoute;
   }
 
-  config.routing.enabled ??= false;
-  config.routing.routes ??= {};
+  config.enabled ??= false;
+  config.routes ??= {};
   for (const routeName of ROUTE_ORDER) {
-    const existing = config.routing.routes[routeName] ?? {};
+    const existing = config.routes[routeName] ?? {};
     const resolved = resolveRouteState(config, routeName);
-    config.routing.routes[routeName] = {
+    config.routes[routeName] = {
       ...existing,
       description: resolved.description,
       restore: resolved.restore,
@@ -321,15 +316,14 @@ export async function applyRoute(
   config: Config,
   routeName: RouteName,
 ): Promise<boolean> {
-  if (config.routing?.enabled === false) return false;
+  if (config.enabled === false) return false;
   const state = resolveRouteState(config, routeName);
   if (!state.provider || !state.model) return false;
   const model = ctx.modelRegistry.find(state.provider, state.model);
   if (!model) return false;
 
-  config.routing ??= {};
-  if (ctx.model && !config.routing.previous) {
-    config.routing.previous = {
+  if (ctx.model && !config.previous) {
+    config.previous = {
       provider: ctx.model.provider,
       model: ctx.model.id,
       thinkingLevel: pi.getThinkingLevel(),
@@ -338,7 +332,7 @@ export async function applyRoute(
 
   if (!(await pi.setModel(model))) return false;
   pi.setThinkingLevel(state.thinkingLevel ?? highestThinkingLevel(model));
-  config.routing.activeRoute = routeName;
+  config.activeRoute = routeName;
   persistConfig(ctx, config);
   setStatus(ctx, "route", `route:${routeName}`);
   return true;
@@ -349,21 +343,21 @@ export async function restoreRoute(
   pi: ExtensionAPI,
   config: Config,
 ): Promise<boolean> {
-  const prev = config.routing?.previous;
+  const prev = config.previous;
   if (prev?.provider && prev.model) {
     const model = ctx.modelRegistry.find(prev.provider, prev.model);
     if (model && (await pi.setModel(model))) {
       pi.setThinkingLevel(prev.thinkingLevel ?? highestThinkingLevel(model));
-      delete config.routing?.activeRoute;
-      delete config.routing?.previous;
+      delete config.activeRoute;
+      delete config.previous;
       persistConfig(ctx, config);
       setStatus(ctx, "route", undefined);
       return true;
     }
   }
 
-  delete config.routing?.activeRoute;
-  delete config.routing?.previous;
+  delete config.activeRoute;
+  delete config.previous;
   persistConfig(ctx, config);
   setStatus(ctx, "route", undefined);
   return false;
