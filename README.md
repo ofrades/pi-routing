@@ -64,16 +64,16 @@ context?: "fresh" | "fork"    # default: fresh
 cwd?: string                   # default: current cwd
 ```
 
-Default route-to-agent mapping:
+Default route-to-agent mapping (AmpCode-style naming):
 
 | Route | Default subagent |
 |-------|------------------|
-| `search` | `scout` |
-| `review` | `reviewer` |
+| `search` | `search` |
+| `review` | `review` |
 | `oracle` | `oracle` |
-| `librarian` | `researcher` |
-| `handoff` | `delegate` |
-| `vision` | `delegate` |
+| `librarian` | `librarian` |
+| `handoff` | `handoff` |
+| `vision` | `vision` |
 
 Use `context: "fresh"` for cost-effective targeted work. Use `context: "fork"` only when the child needs the current conversation context.
 

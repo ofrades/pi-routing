@@ -44,19 +44,7 @@ type InternalSubagentResponse = {
 };
 
 function defaultAgentForRoute(routeName: RouteName): string {
-  switch (routeName) {
-    case "search":
-      return "scout";
-    case "review":
-      return "reviewer";
-    case "oracle":
-      return "oracle";
-    case "librarian":
-      return "researcher";
-    case "handoff":
-    case "vision":
-      return "delegate";
-  }
+  return routeName;
 }
 
 function extractTextFromDelegatedMessages(messages: unknown[] | undefined): string {
@@ -491,7 +479,7 @@ export default function routingExtension(pi: ExtensionAPI) {
     parameters: Type.Object({
       task: StringEnum(ROUTE_ORDER),
       prompt: Type.String({ description: "The concrete task to give the delegated child agent." }),
-      agent: Type.Optional(Type.String({ description: "Override subagent name. Defaults by route: search=scout, review=reviewer, oracle=oracle, librarian=researcher, others=delegate." })),
+      agent: Type.Optional(Type.String({ description: "Override subagent name. Defaults by route: search=search, review=review, oracle=oracle, librarian=librarian, handoff=handoff, vision=vision." })),
       context: Type.Optional(StringEnum(["fresh", "fork"] as const)),
       cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Defaults to current cwd." })),
     }),
