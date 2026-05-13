@@ -9,75 +9,121 @@ import {
   createLsTool,
   createReadTool,
   getAgentDir,
-  ModelSelectorComponent,
-  SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import { StringEnum, type ModelThinkingLevel } from "@earendil-works/pi-ai";
+import { getSupportedThinkingLevels, StringEnum, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
-import {
-  applyRoute,
-  highestThinkingLevel,
-  isRouteName,
-  loadConfig,
-  notify,
-  persistConfig,
-  resolveRouteState,
-  restoreRoute,
-  ROUTE_ORDER,
-  setStatus,
-  supportedThinkingLevels,
-  withConfig,
-  type Config,
-  type RouteName,
-} from "../src/mode-core.ts";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { basename, join } from "node:path";
+import { readFile } from "node:fs/promises";
 
-type DelegationContext = "fresh" | "fork";
+// --- Domain ---
 
-type InternalSubagentResponse = {
-  agent: string;
-  task: string;
-  context: DelegationContext;
+export type RouteName = "eagle" | "search" | "review" | "oracle" | "librarian";
+
+const ROUTE_ORDER: RouteName[] = ["eagle", "search", "review", "oracle", "librarian"];
+
+type RouteConfig = {
+  provider: string;
   model: string;
-  cwd: string;
-  text: string;
-  messages: AgentMessage[];
+  thinkingLevel?: ModelThinkingLevel;
 };
 
-function defaultAgentForRoute(routeName: RouteName): string {
-  return routeName;
-}
+type Config = {
+  routes?: Partial<Record<RouteName, RouteConfig>>;
+};
 
-function extractTextFromDelegatedMessages(messages: unknown[] | undefined): string {
-  if (!Array.isArray(messages)) return "";
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-    if (!message || typeof message !== "object") continue;
-    if ((message as { role?: unknown }).role !== "assistant") continue;
-    const content = (message as { content?: unknown }).content;
-    if (!Array.isArray(content)) continue;
-    for (let j = content.length - 1; j >= 0; j--) {
-      const block = content[j];
-      if (!block || typeof block !== "object") continue;
-      if ((block as { type?: unknown }).type !== "text") continue;
-      const text = (block as { text?: unknown }).text;
-      if (typeof text === "string" && text.trim()) return text.trim();
-    }
+const ROUTE_METADATA: Record<
+  RouteName,
+  { description: string; recommendedModel: string; systemPrompt: string }
+> = {
+  eagle: {
+    description:
+      "Image and screenshot understanding. Describe visual content precisely so the main agent can act on it.",
+    recommendedModel: "Gemini 3 Flash",
+    systemPrompt:
+      "You are an eagle subagent. Describe images, screenshots, and visual content precisely and completely. Include all text, UI elements, layout, colors, and any information visible. Be thorough — the main agent will rely entirely on your description.",
+  },
+  search: {
+    description: "Fast retrieval-oriented codebase search and context gathering.",
+    recommendedModel: "Gemini 3 Flash",
+    systemPrompt:
+      "You are a search subagent. Use local code search tools to find relevant files, functions, and context. Prefer reading over guessing. Do not edit files. Bash is for read-only commands only, such as rg, git grep, find, ls, and other inspection commands. Return concise findings with: relevant files and line ranges, key symbols/functions, important excerpts, and the recommended starting point.",
+  },
+  review: {
+    description: "Code review, bug finding, regression/security/maintainability checks.",
+    recommendedModel: "Gemini 3.1 Pro",
+    systemPrompt:
+      "You are a review subagent. Check for correctness, regressions, security issues, unnecessary complexity, and missing tests. Be specific: include file paths, line numbers, and concrete suggestions. Do not edit files. Bash is for read-only commands only, such as git diff, git log, git show, and listing/searching files. Return concise findings with: files reviewed, critical issues, warnings, suggestions, and a brief summary.",
+  },
+  oracle: {
+    description: "Complex reasoning, planning, consistency checks, and architectural tradeoffs.",
+    recommendedModel: "GPT-5.4",
+    systemPrompt:
+      "You are an oracle subagent. Challenge assumptions, identify risks and tradeoffs, and recommend a clear path. Think carefully before answering. Do not edit files. Return concise findings with: recommendation, tradeoffs, risks, and next steps.",
+  },
+  librarian: {
+    description: "External docs, dependencies, APIs, and unfamiliar library research.",
+    recommendedModel: "Claude Sonnet 4.6",
+    systemPrompt:
+      "You are a librarian subagent. Research external documentation, APIs, libraries, and public source code using available tools. Cite URLs and source names. Return actionable findings. Do not edit files. Bash is for read-only commands only, such as curl, package-manager metadata queries, git/gh read operations, and local inspection commands. Return concise findings with: sources/URLs, key findings, and actionable implications.",
+  },
+};
+
+// --- Config persistence ---
+
+const SETTINGS_PATH = join(getAgentDir(), "settings.json");
+
+function readSettings(): Record<string, unknown> {
+  try {
+    return existsSync(SETTINGS_PATH) ? JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) : {};
+  } catch {
+    return {};
   }
-  return "";
 }
 
-function modelSupportsImages(model: unknown): boolean {
-  const input = (model as { input?: unknown }).input;
-  return Array.isArray(input) && input.includes("image");
+function loadConfig(): Config {
+  const settings = readSettings();
+  const routing = settings.routing;
+  return routing && typeof routing === "object" ? (routing as Config) : {};
 }
 
-function textMentionsImagePath(text: string): boolean {
-  return /(?:^|\s)(?:\.?\.?\/|~\/|\/)[^\s`'"<>]+\.(?:png|jpe?g|gif|webp|bmp|tiff?)(?:\s|$)/i.test(text);
+function persistConfig(ctx: ExtensionContext, config: Config): void {
+  try {
+    const settings = readSettings();
+    settings.routing = config;
+    writeFileSync(SETTINGS_PATH, `${JSON.stringify(settings, null, 2)}\n`);
+  } catch (error) {
+    notify(
+      ctx,
+      `Could not save routing config: ${error instanceof Error ? error.message : String(error)}`,
+      "error",
+    );
+  }
 }
 
-function requestContainsImage(event: { prompt?: unknown; images?: unknown }): boolean {
-  if (Array.isArray(event.images) && event.images.length > 0) return true;
-  return typeof event.prompt === "string" && textMentionsImagePath(event.prompt);
+// --- Utilities ---
+
+function notify(
+  ctx: ExtensionContext,
+  message: string,
+  level: "info" | "warning" | "error" = "info",
+): void {
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+}
+
+function highestThinkingLevel(model: unknown): ModelThinkingLevel {
+  try {
+    const levels = getSupportedThinkingLevels(
+      model as Parameters<typeof getSupportedThinkingLevels>[0],
+    );
+    const order: ModelThinkingLevel[] = ["xhigh", "high", "medium", "low", "minimal", "off"];
+    const supported = new Set(levels);
+    return order.find((l) => supported.has(l)) ?? "off";
+  } catch {
+    return "off";
+  }
 }
 
 function toolsForRoute(routeName: RouteName, cwd: string) {
@@ -87,129 +133,85 @@ function toolsForRoute(routeName: RouteName, cwd: string) {
     createFindTool(cwd),
     createLsTool(cwd),
   ];
-
-  switch (routeName) {
-    case "search":
-    case "librarian":
-      return [...readOnly, createBashTool(cwd)];
-    case "review":
-    case "oracle":
-    case "handoff":
-    case "vision":
-      return readOnly;
+  if (routeName === "search" || routeName === "librarian" || routeName === "review") {
+    return [...readOnly, createBashTool(cwd)];
   }
+  return readOnly;
 }
 
-function systemPromptForRoute(routeName: RouteName, agent: string): string {
-  const base = [
-    `You are a focused ${agent} subagent for the ${routeName} route.`,
-    "Work independently and keep output concise.",
-    "Prefer reading/searching over guessing. Include relevant file paths, commands, and sources.",
-    "Do not edit files; return findings and recommendations only.",
-  ];
-
-  if (routeName === "search") {
-    base.push("Use local code search first. If external/current information is required, use bash with network tools such as curl when available.");
+function extractLastAssistantText(messages: AgentMessage[]): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i];
+    if (!msg || typeof msg !== "object") continue;
+    if ((msg as { role?: unknown }).role !== "assistant") continue;
+    const content = (msg as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j];
+      if ((block as { type?: unknown })?.type === "text") {
+        const text = (block as { text?: unknown }).text;
+        if (typeof text === "string" && text.trim()) return text.trim();
+      }
+    }
   }
-  if (routeName === "librarian") {
-    base.push("Focus on external documentation. Use bash with network tools such as curl when available, and cite URLs or source names.");
-  }
-  if (routeName === "review") {
-    base.push("Focus on correctness, regressions, security, tests, and unnecessary complexity.");
-  }
-  if (routeName === "oracle") {
-    base.push("Challenge assumptions and identify risks/tradeoffs before recommending a path.");
-  }
-
-  return base.join("\n");
+  return "";
 }
 
-async function runInternalSubagent(
+// --- Subagent runner ---
+
+type ImageInput = { type: "image"; data: string; mimeType: string };
+
+async function runSubagent(
   ctx: ExtensionContext,
   routeName: RouteName,
-  request: {
-    agent: string;
-    task: string;
-    context: DelegationContext;
-    model: string;
-    cwd: string;
-    thinkingLevel: ModelThinkingLevel;
-  },
+  prompt: string,
+  routeConfig: RouteConfig,
   signal?: AbortSignal,
-  onUpdate?: (partialResult: {
-    content: Array<{ type: "text"; text: string }>;
-    details: Partial<InternalSubagentResponse> & { status?: string; turns?: number };
-  }) => void,
-): Promise<InternalSubagentResponse> {
-  const [provider, ...modelParts] = request.model.split("/");
-  const modelId = modelParts.join("/");
-  const model = ctx.modelRegistry.find(provider, modelId);
-  if (!model) throw new Error(`Model unavailable for delegated route: ${request.model}`);
+  onUpdate?: (text: string, status: string) => void,
+  images?: ImageInput[],
+): Promise<string> {
+  const model = ctx.modelRegistry.find(routeConfig.provider, routeConfig.model);
+  if (!model) throw new Error(`Model not available: ${routeConfig.provider}/${routeConfig.model}`);
 
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-  if (!auth.ok) throw new Error(auth.error);
-
-  const seedMessages: AgentMessage[] = [];
-  if (request.context === "fork") {
-    seedMessages.push(...ctx.sessionManager.getBranch()
-      .filter((entry) => entry.type === "message")
-      .map((entry) => entry.message));
-  }
+  const thinkingLevel = routeConfig.thinkingLevel ?? highestThinkingLevel(model);
+  const meta = ROUTE_METADATA[routeName];
 
   const agent = new Agent({
     initialState: {
       model,
-      thinkingLevel: request.thinkingLevel,
-      systemPrompt: systemPromptForRoute(routeName, request.agent),
-      tools: toolsForRoute(routeName, request.cwd),
-      messages: seedMessages,
+      thinkingLevel,
+      systemPrompt: meta.systemPrompt,
+      tools: toolsForRoute(routeName, ctx.cwd),
+      messages: [],
     },
     convertToLlm,
-    getApiKey: async () => auth.apiKey,
     toolExecution: "parallel",
   });
 
-  let turns = 0;
-  let lastUpdateAt = 0;
   let latestText = "";
-  const emitProgress = (status: string, force = false) => {
+  let lastUpdateAt = 0;
+
+  const modelLabel = `${routeConfig.provider}/${routeConfig.model}`;
+
+  const emit = (status: string, force = false) => {
     const now = Date.now();
     if (!force && now - lastUpdateAt < 250) return;
     lastUpdateAt = now;
-    if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent} · ${status}`);
-    onUpdate?.({
-      content: [
-        {
-          type: "text",
-          text: latestText
-            ? `Delegating ${routeName} to internal ${request.agent} (${status})...\n\n${latestText}`
-            : `Delegating ${routeName} to internal ${request.agent} (${status})...`,
-        },
-      ],
-      details: {
-        agent: request.agent,
-        task: request.task,
-        context: request.context,
-        model: request.model,
-        cwd: request.cwd,
-        status,
-        turns,
-      },
-    });
+    if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `[${routeName}] ${modelLabel} · ${status}`);
+    onUpdate?.(latestText, status);
   };
 
   const unsubscribe = agent.subscribe((event) => {
     if (event.type === "turn_start") {
-      turns += 1;
-      emitProgress(`turn ${turns}`, true);
+      emit("thinking", true);
     } else if (event.type === "message_update") {
-      const text = extractTextFromDelegatedMessages([event.message]);
+      const text = extractLastAssistantText([event.message]);
       if (text) latestText = text;
-      emitProgress("responding");
+      emit("responding");
     } else if (event.type === "tool_execution_start") {
-      emitProgress(event.toolName, true);
+      emit(event.toolName, true);
     } else if (event.type === "tool_execution_end") {
-      emitProgress(`${event.toolName} done`, true);
+      emit(`${event.toolName} done`, true);
     }
   });
 
@@ -220,289 +222,383 @@ async function runInternalSubagent(
   }
 
   try {
-    emitProgress("starting", true);
-    await agent.prompt(request.task);
+    notify(ctx, `[${routeName}] → ${modelLabel} (thinking:${thinkingLevel})`, "info");
+    emit("starting", true);
+    await agent.prompt(prompt, images);
   } finally {
     if (signal) signal.removeEventListener("abort", onAbort);
     unsubscribe();
     if (ctx.hasUI) ctx.ui.setStatus("route-delegate", undefined);
+    notify(ctx, `[${routeName}] ← done`, "info");
   }
 
-  const messages = agent.state.messages;
-  const text = extractTextFromDelegatedMessages(messages) || "(no delegated output)";
-  return {
-    agent: request.agent,
-    task: request.task,
-    context: request.context,
-    model: request.model,
-    cwd: request.cwd,
-    text,
-    messages,
-  };
+  return extractLastAssistantText(agent.state.messages) || "(no output)";
 }
 
-async function pickModel(
-  ctx: ExtensionContext,
-  config: Config,
-  routeName: RouteName,
-): Promise<{ provider: string; model: string } | undefined> {
-  const route = resolveRouteState(config, routeName);
-  const currentModel =
-    (route.provider && route.model
-      ? ctx.modelRegistry.find(route.provider, route.model)
-      : undefined) ?? ctx.model;
-  const settingsManager = SettingsManager.create(ctx.cwd, getAgentDir());
+// --- Pi subprocess subagent runner ---
 
-  const selected = await ctx.ui.custom<import("@earendil-works/pi-ai").Model<any> | null>(
-    (tui, _theme, _kb, done) =>
-      new ModelSelectorComponent(
-        tui,
-        currentModel,
-        settingsManager,
-        ctx.modelRegistry,
-        [],
-        (model) => done(model),
-        () => done(null),
+type UsageStats = {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+  cost: number;
+  contextTokens: number;
+  turns: number;
+};
+
+type SubprocessResult = {
+  text: string;
+  stderr: string;
+  nonJsonStdout: string;
+  exitCode: number;
+  usage: UsageStats;
+  stopReason?: string;
+  errorMessage?: string;
+};
+
+function toolNamesForRoute(routeName: RouteName): string[] {
+  const readOnly = ["read", "grep", "find", "ls"];
+  if (routeName === "search" || routeName === "librarian" || routeName === "review") {
+    return [...readOnly, "bash"];
+  }
+  return readOnly;
+}
+
+function modelSpecForRoute(ctx: ExtensionContext, routeConfig: RouteConfig): string {
+  const base = `${routeConfig.provider}/${routeConfig.model}`;
+  if (routeConfig.thinkingLevel) return `${base}:${routeConfig.thinkingLevel}`;
+
+  const model = ctx.modelRegistry.find(routeConfig.provider, routeConfig.model);
+  if (!model) return base;
+  return `${base}:${highestThinkingLevel(model)}`;
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+  const currentScript = process.argv[1];
+  const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+  if (currentScript && !isBunVirtualScript && existsSync(currentScript)) {
+    return { command: process.execPath, args: [currentScript, ...args] };
+  }
+
+  const execName = basename(process.execPath).toLowerCase();
+  const isGenericRuntime = /^(node|bun)(\.exe)?$/.test(execName);
+  if (!isGenericRuntime) return { command: process.execPath, args };
+
+  return { command: "pi", args };
+}
+
+function assistantTextFromMessage(message: unknown): string {
+  const msg = message as { role?: unknown; content?: unknown; stopReason?: unknown; errorMessage?: unknown };
+  if (msg.role !== "assistant" || !Array.isArray(msg.content)) return "";
+  const texts = msg.content
+    .filter((part): part is { type: string; text: string } =>
+      Boolean(
+        part &&
+          typeof part === "object" &&
+          (part as { type?: unknown }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string",
       ),
-  );
-
-  return selected ? { provider: selected.provider, model: selected.id } : undefined;
+    )
+    .map((part) => part.text)
+    .join("");
+  return texts.trim();
 }
 
-async function pickThinkingLevel(
+function createUsageStats(): UsageStats {
+  return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
+}
+
+function addMessageUsage(usageStats: UsageStats, message: unknown): void {
+  const msg = message as { role?: unknown; usage?: unknown };
+  if (msg.role !== "assistant") return;
+
+  const usage = msg.usage as
+    | {
+        input?: number;
+        output?: number;
+        cacheRead?: number;
+        cacheWrite?: number;
+        totalTokens?: number;
+        cost?: { total?: number } | number;
+      }
+    | undefined;
+  if (!usage || typeof usage !== "object") return;
+
+  usageStats.input += usage.input ?? 0;
+  usageStats.output += usage.output ?? 0;
+  usageStats.cacheRead += usage.cacheRead ?? 0;
+  usageStats.cacheWrite += usage.cacheWrite ?? 0;
+  // totalTokens reflects the current request/context total, so keep the latest observed value.
+  usageStats.contextTokens = usage.totalTokens ?? usageStats.contextTokens;
+  usageStats.cost += typeof usage.cost === "number" ? usage.cost : usage.cost?.total ?? 0;
+}
+
+async function runPiSubagent(
   ctx: ExtensionContext,
-  config: Config,
   routeName: RouteName,
-): Promise<ModelThinkingLevel | undefined> {
-  const route = resolveRouteState(config, routeName);
-  const model =
-    route.provider && route.model
-      ? ctx.modelRegistry.find(route.provider, route.model)
-      : undefined;
-  const current = route.thinkingLevel ?? highestThinkingLevel(model);
-  const levels = [current, ...supportedThinkingLevels(model).filter((level) => level !== current)];
-  const labels = levels.map((level) => (level === current ? `${level} [current]` : level));
-  const selected = await ctx.ui.select(`Thinking for ${routeName}`, labels);
-  return selected ? levels[labels.indexOf(selected)] : undefined;
-}
+  prompt: string,
+  routeConfig: RouteConfig,
+  signal?: AbortSignal,
+  onUpdate?: (text: string, status: string) => void,
+): Promise<SubprocessResult> {
+  const modelSpec = modelSpecForRoute(ctx, routeConfig);
+  const tmpDir = mkdtempSync(join(tmpdir(), "pi-routing-subagent-"));
+  const promptPath = join(tmpDir, `${routeName}.md`);
+  writeFileSync(promptPath, ROUTE_METADATA[routeName].systemPrompt, { encoding: "utf8", mode: 0o600 });
 
-async function showRouteSelector(
-  ctx: ExtensionContext,
-  pi: ExtensionAPI,
-  config: Config,
-): Promise<void> {
-  let selectedIndex = Math.max(
-    0,
-    ROUTE_ORDER.indexOf(config.activeRoute ?? "vision"),
-  );
+  const args = [
+    "--mode",
+    "json",
+    "-p",
+    "--no-session",
+    "--model",
+    modelSpec,
+    "--tools",
+    toolNamesForRoute(routeName).join(","),
+    "--append-system-prompt",
+    promptPath,
+    `Task: ${prompt}`,
+  ];
 
-  while (true) {
-    const result = await ctx.ui.custom<{
-      action: "confirm" | "thinking" | "model" | "toggle" | "cancel";
-      routeName: RouteName;
-    }>((tui, theme, _kb, done) => ({
-      render(_width: number) {
-        const enabled = config.enabled ?? false;
-        const lines: string[] = [
-          theme.fg("accent", theme.bold(`Routing · ${enabled ? "on" : "off"}`)),
-        ];
-        for (const [index, name] of ROUTE_ORDER.entries()) {
-          const route = resolveRouteState(config, name);
-          const configured =
-            route.provider && route.model
-              ? `${route.provider}/${route.model}`
-              : "unconfigured";
-          const thinking = route.thinkingLevel ? ` · thinking:${route.thinkingLevel}` : "";
-          const line = `${index === selectedIndex ? "→ " : "  "}${name} — ${configured}${thinking}${
-            name === config.activeRoute ? " [active]" : ""
-          }`;
-          lines.push(index === selectedIndex ? theme.fg("accent", line) : line);
+  let latestText = "";
+  let stderr = "";
+  let nonJsonStdout = "";
+  const usage = createUsageStats();
+  let stopReason: string | undefined;
+  let errorMessage: string | undefined;
+  let wasAborted = false;
+
+  const modelLabel = `${routeConfig.provider}/${routeConfig.model}`;
+  notify(ctx, `[${routeName}] → ${modelLabel} (--no-session)`, "info");
+  onUpdate?.("", "starting");
+
+  try {
+    const exitCode = await new Promise<number>((resolve) => {
+      const invocation = getPiInvocation(args);
+      const proc = spawn(invocation.command, invocation.args, {
+        cwd: ctx.cwd,
+        shell: false,
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+
+      let buffer = "";
+      const processLine = (line: string) => {
+        if (!line.trim()) return;
+        let event: any;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          const nextStdout = `${nonJsonStdout}${line}\n`;
+          const maxStdoutBytes = 64 * 1024;
+          nonJsonStdout =
+            nextStdout.length > maxStdoutBytes
+              ? `${nextStdout.slice(-maxStdoutBytes)}\n[truncated earlier non-JSON stdout]\n`
+              : nextStdout;
+          return;
         }
-        lines.push(
-          theme.fg(
-            "dim",
-            "↑↓/j/k choose • Enter apply • t thinking • c model • e toggle • Esc cancel",
-          ),
-        );
-        return lines;
-      },
-      invalidate() {},
-      handleInput(data: string) {
-        const routeName = ROUTE_ORDER[selectedIndex];
-        if (data === "\r" || data === "\n") done({ action: "confirm", routeName });
-        else if (data === "t" || data === "T") done({ action: "thinking", routeName });
-        else if (data === "c" || data === "C") done({ action: "model", routeName });
-        else if (data === "e" || data === "E") done({ action: "toggle", routeName });
-        else if (data === "\u001b[A" || data === "k") {
-          selectedIndex = (selectedIndex - 1 + ROUTE_ORDER.length) % ROUTE_ORDER.length;
-          tui.requestRender();
-        } else if (data === "\u001b[B" || data === "j") {
-          selectedIndex = (selectedIndex + 1) % ROUTE_ORDER.length;
-          tui.requestRender();
-        } else if (data === "\u001b" || data.startsWith("\u001b")) {
-          done({ action: "cancel", routeName });
+
+        if (event.type === "turn_start") {
+          usage.turns += 1;
+          onUpdate?.(latestText, "thinking");
+        } else if (event.type === "message_update" || event.type === "message_end") {
+          const text = assistantTextFromMessage(event.message);
+          if (text) latestText = text;
+          if (event.message?.stopReason) stopReason = event.message.stopReason;
+          if (event.message?.errorMessage) errorMessage = event.message.errorMessage;
+          if (event.type === "message_end") addMessageUsage(usage, event.message);
+          onUpdate?.(latestText, "responding");
+        } else if (event.type === "tool_execution_start") {
+          onUpdate?.(latestText, String(event.toolName ?? "tool"));
+        } else if (event.type === "tool_execution_end") {
+          onUpdate?.(latestText, `${String(event.toolName ?? "tool")} done`);
         }
-      },
-    }));
+      };
 
-    if (!result || result.action === "cancel") return;
-    selectedIndex = ROUTE_ORDER.indexOf(result.routeName);
+      proc.stdout.on("data", (data) => {
+        buffer += data.toString();
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+        for (const line of lines) processLine(line);
+      });
+      proc.stderr.on("data", (data) => {
+        stderr += data.toString();
+      });
+      let settled = false;
+      const cleanupAbortListener = () => signal?.removeEventListener("abort", killProc);
+      const settle = (code: number) => {
+        if (settled) return;
+        settled = true;
+        cleanupAbortListener();
+        resolve(code);
+      };
+      const killProc = () => {
+        if (settled) return;
+        wasAborted = true;
+        proc.kill("SIGTERM");
+        setTimeout(() => {
+          if (!proc.killed) proc.kill("SIGKILL");
+        }, 5000);
+      };
 
-    if (result.action === "toggle") {
-      config.enabled = !(config.enabled ?? false);
-      persistConfig(ctx, config);
-      notify(ctx, `Task routing ${config.enabled ? "enabled" : "disabled"}`, "info");
-    } else if (result.action === "thinking") {
-      const level = await pickThinkingLevel(ctx, config, result.routeName);
-      if (level) {
-        config.routes ??= {};
-        config.routes[result.routeName] = {
-          ...config.routes[result.routeName],
-          thinkingLevel: level,
-        };
-        persistConfig(ctx, config);
-      }
-    } else if (result.action === "model") {
-      const model = await pickModel(ctx, config, result.routeName);
-      if (model) {
-        config.routes ??= {};
-        config.routes[result.routeName] = {
-          ...config.routes[result.routeName],
-          provider: model.provider,
-          model: model.model,
-        };
-        persistConfig(ctx, config);
-      }
-    } else {
-      const ok = await applyRoute(ctx, pi, config, result.routeName);
-      if (!ok) {
-        notify(
-          ctx,
-          `Route "${result.routeName}" is not configured or routing is disabled.`,
-          "error",
-        );
-        continue;
-      }
-      return;
+      proc.on("close", (code) => {
+        if (buffer.trim()) processLine(buffer);
+        settle(code ?? 0);
+      });
+      proc.on("error", (error) => {
+        stderr += error instanceof Error ? error.message : String(error);
+        settle(1);
+      });
+
+      if (signal?.aborted) killProc();
+      else signal?.addEventListener("abort", killProc, { once: true });
+    });
+
+    notify(ctx, `[${routeName}] ← done`, "info");
+    if (wasAborted) throw new Error("Subagent was aborted");
+    return { text: latestText || "(no output)", stderr, nonJsonStdout, exitCode, usage, stopReason, errorMessage };
+  } finally {
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // Ignore cleanup errors so they do not mask the subagent result/error.
     }
   }
 }
+
+// --- Extension ---
 
 export default function routingExtension(pi: ExtensionAPI) {
-  let config = loadConfig();
-  let pendingModelReassert:
-    | { provider: string; model: string; thinkingLevel?: ModelThinkingLevel; routeName?: RouteName }
-    | undefined;
-  let autoRestoreRoute: RouteName | undefined;
+  pi.registerTool({
+    name: "describe_image",
+    label: "Describe Image",
+    description:
+      "Read an image file from disk and describe its contents using the configured eagle model. Use this whenever you encounter an image path you cannot see directly.",
+    promptSnippet:
+      "Use describe_image whenever the user references an image file path and you cannot see it. Pass the exact path.",
+    promptGuidelines: [
+      "Call this before acting on any image the user references by path.",
+      "The returned description is the full visual context — treat it as ground truth for that image.",
+    ],
+    parameters: Type.Object({
+      path: Type.String({ description: "Absolute or relative path to the image file." }),
+      prompt: Type.Optional(
+        Type.String({ description: "Optional question or focus for the description." }),
+      ),
+    }),
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
+      const config = loadConfig();
+      const eagleRoute = config.routes?.eagle;
+      if (!eagleRoute) {
+        throw new Error(
+          "Eagle route is not configured. Use /routing set eagle <provider/model>.",
+        );
+      }
 
-  async function autoRouteImageRequest(
-    ctx: ExtensionContext,
-    event: { prompt?: unknown; text?: unknown; images?: unknown },
-  ): Promise<void> {
-    config = withConfig(ctx);
-    if (config.enabled === false) return;
-    const prompt = typeof event.prompt === "string" ? event.prompt : event.text;
-    if (!requestContainsImage({ prompt, images: event.images })) return;
+      const imagePath = params.path.startsWith("/") ? params.path : join(ctx.cwd, params.path);
+      if (!existsSync(imagePath)) {
+        throw new Error(`Image file not found: ${imagePath}`);
+      }
 
-    if (ctx.model && modelSupportsImages(ctx.model)) return;
+      const ext = imagePath.split(".").pop()?.toLowerCase() ?? "";
+      const mimeMap: Record<string, string> = {
+        png: "image/png",
+        jpg: "image/jpeg",
+        jpeg: "image/jpeg",
+        gif: "image/gif",
+        webp: "image/webp",
+        bmp: "image/bmp",
+      };
+      const mimeType = mimeMap[ext];
+      if (!mimeType) throw new Error(`Unsupported image type: .${ext}`);
 
-    const route = resolveRouteState(config, "vision");
-    if (!route.provider || !route.model) {
-      notify(ctx, "Image detected, but the vision route is not configured.", "warning");
-      return;
-    }
+      const data = (await readFile(imagePath)).toString("base64");
+      const describePrompt = params.prompt?.trim()
+        ? params.prompt.trim()
+        : "Describe everything visible in this image in detail. Include all text, UI elements, layout, data, and any other relevant visual information. A coding agent will act on your description.";
 
-    const model = ctx.modelRegistry.find(route.provider, route.model);
-    if (!model) {
-      notify(ctx, `Image detected, but the vision route model is unavailable: ${route.provider}/${route.model}`, "warning");
-      return;
-    }
+      notify(
+        ctx,
+        `[eagle] → ${eagleRoute.provider}/${eagleRoute.model} · describing ${params.path}`,
+        "info",
+      );
 
-    if (!modelSupportsImages(model)) {
-      notify(ctx, `Image detected, but the configured vision model does not advertise image input: ${route.provider}/${route.model}`, "error");
-      return;
-    }
+      const description = await runSubagent(
+        ctx,
+        "eagle",
+        describePrompt,
+        eagleRoute,
+        signal,
+        (text, status) => {
+          onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: text ? `[eagle · ${status}]\n\n${text}` : `[eagle · ${status}]`,
+              },
+            ],
+            details: { status },
+          });
+        },
+        [{ type: "image" as const, data, mimeType }],
+      );
 
-    const ok = await applyRoute(ctx, pi, config, "vision");
-    if (!ok) return;
-    autoRestoreRoute = route.restore === false ? undefined : "vision";
-    notify(ctx, `Auto-routed image request to vision: ${route.provider}/${route.model}`, "info");
-  }
-
-  pi.on("input", async (event, ctx) => {
-    if (event.source === "extension") return { action: "continue" };
-    await autoRouteImageRequest(ctx, event);
-    return { action: "continue" };
-  });
-
-  pi.on("before_agent_start", async (event, ctx) => {
-    await autoRouteImageRequest(ctx, event);
-  });
-
-  pi.on("agent_end", async (_event, ctx) => {
-    config = withConfig(ctx);
-    if (autoRestoreRoute) {
-      autoRestoreRoute = undefined;
-      await restoreRoute(ctx, pi, config);
-      return;
-    }
-    if (!pendingModelReassert) return;
-    const target = pendingModelReassert;
-    pendingModelReassert = undefined;
-    const model = ctx.modelRegistry.find(target.provider, target.model);
-    if (!model) return;
-    if (await pi.setModel(model)) {
-      pi.setThinkingLevel(target.thinkingLevel ?? highestThinkingLevel(model));
-      setStatus(ctx, "route", target.routeName ? `route:${target.routeName}` : undefined);
-    }
-  });
-
-  pi.on("session_start", async (_event, ctx) => {
-    config = withConfig(ctx);
-    setStatus(
-      ctx,
-      "route",
-      config.activeRoute ? `route:${config.activeRoute}` : undefined,
-    );
+      return {
+        content: [{ type: "text", text: description }],
+        details: { path: imagePath, mimeType },
+      };
+    },
   });
 
   pi.registerCommand("routing", {
-    description: "Select or configure task routes",
+    description: "Configure task routes: /routing list | /routing set <route> <provider/model>",
     getArgumentCompletions: (prefix) => {
-      const trimmed = prefix.trimStart();
-      const [first = ""] = trimmed.split(/\s+/);
-      return ["on", "off"]
-        .filter((name) => name.startsWith(first))
-        .map((name) => ({ value: name, label: name }));
+      const [first = ""] = prefix.trimStart().split(/\s+/);
+      return ["list", "set"]
+        .filter((s) => s.startsWith(first))
+        .map((value) => ({ value, label: value }));
     },
     handler: async (args, ctx) => {
-      config = withConfig(ctx);
-      const arg = args.trim();
+      const config = loadConfig();
+      const [subcommand, routeName, modelSpec] = args.trim().split(/\s+/);
 
-      if (arg === "on") {
-        config.enabled = true;
+      if (!subcommand || subcommand === "list") {
+        const lines = ROUTE_ORDER.map((name) => {
+          const route = config.routes?.[name];
+          const meta = ROUTE_METADATA[name];
+          const configured = route
+            ? `${route.provider}/${route.model}`
+            : `unconfigured (recommended: ${meta.recommendedModel})`;
+          return `  ${name}: ${configured} — ${meta.description}`;
+        });
+        notify(ctx, `Routes:\n${lines.join("\n")}`, "info");
+        return;
+      }
+
+      if (subcommand === "set") {
+        if (!routeName || !ROUTE_ORDER.includes(routeName as RouteName)) {
+          notify(
+            ctx,
+            `Unknown route "${routeName}". Use one of: ${ROUTE_ORDER.join(", ")}`,
+            "error",
+          );
+          return;
+        }
+        if (!modelSpec || !modelSpec.includes("/")) {
+          notify(ctx, `Usage: /routing set <route> <provider/model>`, "error");
+          return;
+        }
+        const slashIndex = modelSpec.indexOf("/");
+        const provider = modelSpec.slice(0, slashIndex);
+        const model = modelSpec.slice(slashIndex + 1);
+        config.routes ??= {};
+        config.routes[routeName as RouteName] = { provider, model };
         persistConfig(ctx, config);
-        notify(ctx, "Task routing enabled", "info");
+        notify(ctx, `Route "${routeName}" set to ${provider}/${model}`, "info");
         return;
       }
 
-      if (arg === "off") {
-        config.enabled = false;
-        persistConfig(ctx, config);
-        notify(ctx, "Task routing disabled", "info");
-        return;
-      }
-
-      if (arg) {
-        notify(
-          ctx,
-          `Unknown argument "${arg}". Use: on, off, or no argument for the selector.`,
-          "error",
-        );
-        return;
-      }
-
-      await showRouteSelector(ctx, pi, config);
+      notify(ctx, `Unknown subcommand "${subcommand}". Use: list, set`, "error");
     },
   });
 
@@ -510,202 +606,92 @@ export default function routingExtension(pi: ExtensionAPI) {
     name: "task_delegate",
     label: "Task Delegate",
     description:
-      "Delegate a routed task to an internal focused subagent using the route's configured model, without changing the main session model.",
+      "Delegate a task to a focused subagent using a named route's configured model. Returns the subagent's text output.",
     promptSnippet:
-      "Use task_delegate when a route-specific model should perform a concrete subtask now and return results, especially for search, review, oracle, or librarian work.",
+      "Use task_delegate for search, review, oracle, librarian, or eagle work. The subagent runs independently and returns findings — it does not edit files.",
     promptGuidelines: [
-      "Prefer context='fresh' for cheap search/librarian/review tasks when the prompt includes enough detail.",
-      "Use context='fork' only when the child needs the current conversation context; forked context costs more.",
-      "Use task_delegate with task='vision' for immediate image/PDF/media analysis when a path is mentioned and the current model may not support images.",
-      "Use task_model switch only for changing the main session model; use task_delegate for immediate routed work.",
+      "Use route='eagle' to describe images or screenshots before acting on them. Using describe_image is preferred for image file paths.",
+      "Use route='search' or 'librarian' to gather context before making changes.",
+      "Use route='review' after making changes to catch issues.",
+      "Use route='oracle' for architectural decisions or complex tradeoffs.",
     ],
     parameters: Type.Object({
-      task: StringEnum(ROUTE_ORDER),
-      prompt: Type.String({ description: "The concrete task to give the delegated child agent." }),
-      agent: Type.Optional(Type.String({ description: "Override subagent name. Defaults by route: search=search, review=review, oracle=oracle, librarian=librarian, handoff=handoff, vision=vision." })),
-      context: Type.Optional(StringEnum(["fresh", "fork"] as const)),
-      cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Defaults to current cwd." })),
+      route: StringEnum(ROUTE_ORDER),
+      prompt: Type.String({ description: "The task to give the subagent." }),
+      cwd: Type.Optional(
+        Type.String({ description: "Working directory. Defaults to current cwd." }),
+      ),
     }),
     async execute(_toolCallId, params, signal, onUpdate, ctx) {
-      config = withConfig(ctx);
-      const routingEnabled = config.enabled !== false;
-      if (!routingEnabled) throw new Error("Task routing is disabled.");
+      const config = loadConfig();
+      const routeName = params.route as RouteName;
+      const routeConfig = config.routes?.[routeName];
 
-      const task = params.task as RouteName;
-      if (!isRouteName(task)) {
-        throw new Error(`task is required. Use one of: ${ROUTE_ORDER.join(", ")}`);
-      }
-
-      const prompt = typeof params.prompt === "string" ? params.prompt.trim() : "";
-      if (!prompt) throw new Error("prompt is required for delegated route execution.");
-
-      const route = resolveRouteState(config, task);
-      if (!route.provider || !route.model) {
+      if (!routeConfig) {
         throw new Error(
-          `Route "${task}" is not configured with provider/model in settings. ${route.description}`,
+          `Route "${routeName}" is not configured. Use /routing set ${routeName} <provider/model>.`,
         );
       }
-      const model = ctx.modelRegistry.find(route.provider, route.model);
-      if (!model) throw new Error(`Route "${task}" model is not available: ${route.provider}/${route.model}`);
 
-      const agent =
-        typeof params.agent === "string" && params.agent.trim()
-          ? params.agent.trim()
-          : defaultAgentForRoute(task);
-      const context = params.context === "fork" ? "fork" : "fresh";
       const cwd = typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : ctx.cwd;
-      const modelSpec = `${route.provider}/${route.model}`;
-      const thinking = route.thinkingLevel ?? highestThinkingLevel(model);
-      const delegatedPrompt = [
-        `[Routed task: ${task}]`,
-        `Use model route ${modelSpec} with thinking:${thinking}.`,
-        "Return concise, actionable results. Include file paths and commands when relevant.",
-        "",
-        prompt,
-      ].join("\n");
 
-      notify(ctx, `Delegating ${task} to internal ${agent} on ${modelSpec}`, "info");
-      const response = await runInternalSubagent(
-        ctx,
-        task,
-        {
-          agent,
-          task: delegatedPrompt,
-          context,
-          model: modelSpec,
-          cwd,
-          thinkingLevel: thinking,
-        },
+      const result = await runPiSubagent(
+        { ...ctx, cwd },
+        routeName,
+        params.prompt,
+        routeConfig,
         signal,
-        onUpdate,
+        (latestText, status) => {
+          onUpdate?.({
+            content: [
+              {
+                type: "text",
+                text: latestText
+                  ? `[${routeName} · ${status}]\n\n${latestText}`
+                  : `[${routeName} · ${status}]`,
+              },
+            ],
+            details: { route: routeName, status },
+          });
+        },
       );
 
-      const text = response.text;
-      return {
-        content: [
-          {
-            type: "text",
-            text: `Delegated ${task} to internal ${agent} using ${modelSpec} (${context} context).\n\n${text}`,
+      const isError = result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+      if (isError) {
+        const errorText = result.errorMessage || result.stderr || result.nonJsonStdout || result.text || "(no output)";
+        return {
+          content: [{ type: "text", text: `Subagent ${result.stopReason || "failed"}: ${errorText}` }],
+          details: {
+            route: routeName,
+            model: `${routeConfig.provider}/${routeConfig.model}`,
+            text: result.text,
+            stderr: result.stderr,
+            nonJsonStdout: result.nonJsonStdout,
+            usage: result.usage,
+            exitCode: result.exitCode,
+            stopReason: result.stopReason,
+            errorMessage: result.errorMessage,
           },
-        ],
-        details: response,
-      };
-    },
-  });
-
-  pi.registerTool({
-    name: "task_model",
-    label: "Task Model",
-    description:
-      "Task-aware model router for listing, switching to, and restoring named route models. Inline route execution is intentionally left to prompt-template/subagent extensions.",
-    promptSnippet:
-      "Use task_model to inspect named route models or switch the session to a specialized route when explicitly needed. Prefer prompt-template/subagent workflows for delegated one-shot work.",
-    promptGuidelines: [
-      "Use action='list' or action='status' to inspect route configuration.",
-      "Use action='switch' only when you need to hand off the session to a different route model. Use action='restore' when done.",
-      "For one-shot delegated work, prefer installed prompt-template/subagent commands instead of task_model.",
-    ],
-    parameters: Type.Object({
-      action: StringEnum(["list", "switch", "restore", "status"] as const),
-      task: Type.Optional(StringEnum(ROUTE_ORDER)),
-    }),
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-      config = withConfig(ctx);
-      const routingEnabled = config.enabled !== false;
-
-      if (params.action === "status") {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Task routing is ${routingEnabled ? "enabled" : "disabled"}.${
-                config.activeRoute ? ` Active route: ${config.activeRoute}.` : ""
-              }`,
-            },
-          ],
-          details: undefined,
+          isError: true,
         };
       }
-
-      if (params.action === "list") {
-        const lines = ROUTE_ORDER.map((routeName) => {
-          const route = resolveRouteState(config, routeName);
-          const configured =
-            route.provider && route.model ? `${route.provider}/${route.model}` : "unconfigured";
-          const model =
-            route.provider && route.model
-              ? ctx.modelRegistry.find(route.provider, route.model)
-              : undefined;
-          const thinkingLevel =
-            route.thinkingLevel ?? (model ? highestThinkingLevel(model) : undefined);
-          return `- ${routeName}: ${configured}${
-            thinkingLevel ? ` · thinking:${thinkingLevel}` : ""
-          } · ${route.description}`;
-        });
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Task routing: ${routingEnabled ? "enabled" : "disabled"}\n${lines.join("\n")}`,
-            },
-          ],
-          details: undefined,
-        };
-      }
-
-      if (params.action === "restore") {
-        const previous = config.previous;
-        const ok = await restoreRoute(ctx, pi, config);
-        if (!ok) throw new Error("Could not restore previous/main model.");
-        pendingModelReassert =
-          previous?.provider && previous.model
-            ? {
-                provider: previous.provider,
-                model: previous.model,
-                thinkingLevel: previous.thinkingLevel,
-              }
-            : undefined;
-        return {
-          content: [{ type: "text", text: "Restored previous/main model." }],
-          details: undefined,
-        };
-      }
-
-      const task = params.task as RouteName | undefined;
-      if (!task || !isRouteName(task)) {
-        throw new Error(`task is required. Use one of: ${ROUTE_ORDER.join(", ")}`);
-      }
-      if (!routingEnabled) {
-        throw new Error("Task routing is disabled.");
-      }
-
-      const route = resolveRouteState(config, task);
-      if (!route.provider || !route.model) {
-        throw new Error(
-          `Route "${task}" is not configured with provider/model in settings. ${route.description}`,
-        );
-      }
-
-      const model = ctx.modelRegistry.find(route.provider, route.model);
-      const thinkingLevel = route.thinkingLevel ?? highestThinkingLevel(model);
-      const ok = await applyRoute(ctx, pi, config, task);
-      if (!ok) throw new Error(`Failed to switch to ${task}: ${route.provider}/${route.model}`);
-
-      pendingModelReassert = {
-        provider: route.provider,
-        model: route.model,
-        thinkingLevel: route.thinkingLevel ?? thinkingLevel,
-        routeName: task,
-      };
 
       return {
         content: [
           {
             type: "text",
-            text: `Switched to ${task}: ${route.provider}/${route.model} · thinking:${thinkingLevel}. IMPORTANT: pi model changes take effect on the next user turn, not the current turn. Call action='restore' when the specialized work is complete.`,
+            text: `[${routeName} via ${routeConfig.provider}/${routeConfig.model}]\n\n${result.text}`,
           },
         ],
-        details: undefined,
+        details: {
+          route: routeName,
+          model: `${routeConfig.provider}/${routeConfig.model}`,
+          text: result.text,
+          stderr: result.stderr,
+          nonJsonStdout: result.nonJsonStdout,
+          usage: result.usage,
+          exitCode: result.exitCode,
+        },
       };
     },
   });
