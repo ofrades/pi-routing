@@ -8,6 +8,8 @@ Experimental lightweight named route switching for [Pi](https://github.com/earen
 pi install git:github.com/ofrades/pi-routing
 ```
 
+`task_delegate` runs built-in focused subagents internally; no separate subagent package is required.
+
 ## Concepts
 
 **Routes** are task-specific model overrides (`vision`, `handoff`, `search`, `review`, `oracle`, `librarian`). When a task needs a different capability, the agent can switch to the right model for that route and restore the previous one when done.
@@ -23,7 +25,9 @@ pi install git:github.com/ofrades/pi-routing
 
 Routes are meant to be temporary. Use `task_model` with `action='switch'` only when you need to hand off the session to a different model, and always follow with `action='restore'` when done.
 
-Inline one-shot delegation is intentionally not implemented here; use prompt-template/subagent extensions such as `pi-prompt-template-model` for that workflow.
+For immediate one-shot work, use `task_delegate` to run an internal focused subagent, or define slash-command workflows with `pi-prompt-template-model`.
+
+Image requests are auto-routed before the model turn starts when routing is enabled and the user prompt includes attached images or image file paths such as `/tmp/pi-clipboard-....png`. The vision route must be configured to a model that advertises image input.
 
 ## Commands
 
@@ -48,6 +52,33 @@ Inside the selector:
 
 ## Tools (for the agent)
 
+### `task_delegate`
+
+Delegates a concrete routed task to an internal focused subagent using the route's configured model, without changing the main session model.
+
+```
+task: "search" | "review" | "oracle" | "librarian" | "handoff" | "vision"
+prompt: string                 # concrete task for the child agent
+agent?: string                 # override subagent name
+context?: "fresh" | "fork"    # default: fresh
+cwd?: string                   # default: current cwd
+```
+
+Default route-to-agent mapping:
+
+| Route | Default subagent |
+|-------|------------------|
+| `search` | `scout` |
+| `review` | `reviewer` |
+| `oracle` | `oracle` |
+| `librarian` | `researcher` |
+| `handoff` | `delegate` |
+| `vision` | `delegate` |
+
+Use `context: "fresh"` for cost-effective targeted work. Use `context: "fork"` only when the child needs the current conversation context.
+
+Delegated subagents use read-only local tools by default (`read`, `grep`, `find`, `ls`). The `search` and `librarian` routes also get `bash` so the model can use available CLI/network tools such as `curl` when external information is needed. No bundled web-search API is used.
+
 ### `task_model`
 
 Lists named routes or switches/restores the active session model.
@@ -60,7 +91,7 @@ action: "restore" — return to the previous/main model
 task              — one of: vision, handoff, search, review, oracle, librarian
 ```
 
-`pi-routing` no longer performs inline model calls itself. For one-shot delegated execution, define slash-command workflows with `pi-prompt-template-model` and/or subagents.
+`task_model switch` changes the main session model for the next turn. For immediate one-shot work, use `task_delegate` or define slash-command workflows with `pi-prompt-template-model`.
 
 ## Configuration
 
@@ -84,5 +115,6 @@ Routes without a configured `provider`/`model` are listed as `unconfigured` and 
 ## Notes
 
 - Routing can be disabled globally. When disabled, `task_model switch` returns an error rather than silently using the wrong model.
+- Image prompts are auto-routed to `vision` in the input/before-agent-start path, so the switch applies to the current image turn instead of the next turn.
 - `thinkingLevel` defaults to the highest level supported by the configured model if not explicitly set.
-- Inline route execution and image analysis are expected to come from prompt-template/subagent/model-specific extensions rather than `pi-routing`.
+- `task_delegate` uses internal focused subagents and does not require `pi-subagents`.

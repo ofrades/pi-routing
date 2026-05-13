@@ -1,5 +1,13 @@
+import type { AgentMessage } from "@earendil-works/pi-agent-core";
+import { Agent } from "@earendil-works/pi-agent-core";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
+  convertToLlm,
+  createBashTool,
+  createFindTool,
+  createGrepTool,
+  createLsTool,
+  createReadTool,
   getAgentDir,
   ModelSelectorComponent,
   SettingsManager,
@@ -22,6 +30,185 @@ import {
   type Config,
   type RouteName,
 } from "../src/mode-core.ts";
+
+type DelegationContext = "fresh" | "fork";
+
+type InternalSubagentResponse = {
+  agent: string;
+  task: string;
+  context: DelegationContext;
+  model: string;
+  cwd: string;
+  text: string;
+  messages: AgentMessage[];
+};
+
+function defaultAgentForRoute(routeName: RouteName): string {
+  switch (routeName) {
+    case "search":
+      return "scout";
+    case "review":
+      return "reviewer";
+    case "oracle":
+      return "oracle";
+    case "librarian":
+      return "researcher";
+    case "handoff":
+    case "vision":
+      return "delegate";
+  }
+}
+
+function extractTextFromDelegatedMessages(messages: unknown[] | undefined): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || typeof message !== "object") continue;
+    if ((message as { role?: unknown }).role !== "assistant") continue;
+    const content = (message as { content?: unknown }).content;
+    if (!Array.isArray(content)) continue;
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j];
+      if (!block || typeof block !== "object") continue;
+      if ((block as { type?: unknown }).type !== "text") continue;
+      const text = (block as { text?: unknown }).text;
+      if (typeof text === "string" && text.trim()) return text.trim();
+    }
+  }
+  return "";
+}
+
+function modelSupportsImages(model: unknown): boolean {
+  const input = (model as { input?: unknown }).input;
+  return Array.isArray(input) && input.includes("image");
+}
+
+function textMentionsImagePath(text: string): boolean {
+  return /(?:^|\s)(?:\.?\.?\/|~\/|\/)[^\s`'"<>]+\.(?:png|jpe?g|gif|webp|bmp|tiff?)(?:\s|$)/i.test(text);
+}
+
+function requestContainsImage(event: { prompt?: unknown; images?: unknown }): boolean {
+  if (Array.isArray(event.images) && event.images.length > 0) return true;
+  return typeof event.prompt === "string" && textMentionsImagePath(event.prompt);
+}
+
+function toolsForRoute(routeName: RouteName, cwd: string) {
+  const readOnly = [
+    createReadTool(cwd),
+    createGrepTool(cwd),
+    createFindTool(cwd),
+    createLsTool(cwd),
+  ];
+
+  switch (routeName) {
+    case "search":
+    case "librarian":
+      return [...readOnly, createBashTool(cwd)];
+    case "review":
+    case "oracle":
+    case "handoff":
+    case "vision":
+      return readOnly;
+  }
+}
+
+function systemPromptForRoute(routeName: RouteName, agent: string): string {
+  const base = [
+    `You are a focused ${agent} subagent for the ${routeName} route.`,
+    "Work independently and keep output concise.",
+    "Prefer reading/searching over guessing. Include relevant file paths, commands, and sources.",
+    "Do not edit files; return findings and recommendations only.",
+  ];
+
+  if (routeName === "search") {
+    base.push("Use local code search first. If external/current information is required, use bash with network tools such as curl when available.");
+  }
+  if (routeName === "librarian") {
+    base.push("Focus on external documentation. Use bash with network tools such as curl when available, and cite URLs or source names.");
+  }
+  if (routeName === "review") {
+    base.push("Focus on correctness, regressions, security, tests, and unnecessary complexity.");
+  }
+  if (routeName === "oracle") {
+    base.push("Challenge assumptions and identify risks/tradeoffs before recommending a path.");
+  }
+
+  return base.join("\n");
+}
+
+async function runInternalSubagent(
+  ctx: ExtensionContext,
+  routeName: RouteName,
+  request: {
+    agent: string;
+    task: string;
+    context: DelegationContext;
+    model: string;
+    cwd: string;
+    thinkingLevel: ModelThinkingLevel;
+  },
+  signal?: AbortSignal,
+): Promise<InternalSubagentResponse> {
+  const [provider, ...modelParts] = request.model.split("/");
+  const modelId = modelParts.join("/");
+  const model = ctx.modelRegistry.find(provider, modelId);
+  if (!model) throw new Error(`Model unavailable for delegated route: ${request.model}`);
+
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) throw new Error(auth.error);
+
+  const seedMessages: AgentMessage[] = [];
+  if (request.context === "fork") {
+    seedMessages.push(...ctx.sessionManager.getBranch()
+      .filter((entry) => entry.type === "message")
+      .map((entry) => entry.message));
+  }
+
+  const agent = new Agent({
+    initialState: {
+      model,
+      thinkingLevel: request.thinkingLevel,
+      systemPrompt: systemPromptForRoute(routeName, request.agent),
+      tools: toolsForRoute(routeName, request.cwd),
+      messages: seedMessages,
+    },
+    convertToLlm,
+    getApiKey: async () => auth.apiKey,
+    toolExecution: "parallel",
+  });
+
+  let turns = 0;
+  const unsubscribe = agent.subscribe((event) => {
+    if (event.type === "turn_start") {
+      turns += 1;
+      if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent} · turn ${turns}`);
+    } else if (event.type === "tool_execution_start") {
+      if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent} · ${event.toolName}`);
+    }
+  });
+
+  try {
+    if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent}`);
+    await agent.prompt(request.task);
+  } finally {
+    unsubscribe();
+    if (ctx.hasUI) ctx.ui.setStatus("route-delegate", undefined);
+  }
+
+  if (signal?.aborted) agent.abort();
+
+  const messages = agent.state.messages;
+  const text = extractTextFromDelegatedMessages(messages) || "(no delegated output)";
+  return {
+    agent: request.agent,
+    task: request.task,
+    context: request.context,
+    model: request.model,
+    cwd: request.cwd,
+    text,
+    messages,
+  };
+}
 
 async function pickModel(
   ctx: ExtensionContext,
@@ -175,9 +362,59 @@ export default function routingExtension(pi: ExtensionAPI) {
   let pendingModelReassert:
     | { provider: string; model: string; thinkingLevel?: ModelThinkingLevel; routeName?: RouteName }
     | undefined;
+  let autoRestoreRoute: RouteName | undefined;
+
+  async function autoRouteImageRequest(
+    ctx: ExtensionContext,
+    event: { prompt?: unknown; text?: unknown; images?: unknown },
+  ): Promise<void> {
+    config = withConfig(ctx);
+    if (config.enabled === false) return;
+    const prompt = typeof event.prompt === "string" ? event.prompt : event.text;
+    if (!requestContainsImage({ prompt, images: event.images })) return;
+
+    if (ctx.model && modelSupportsImages(ctx.model)) return;
+
+    const route = resolveRouteState(config, "vision");
+    if (!route.provider || !route.model) {
+      notify(ctx, "Image detected, but the vision route is not configured.", "warning");
+      return;
+    }
+
+    const model = ctx.modelRegistry.find(route.provider, route.model);
+    if (!model) {
+      notify(ctx, `Image detected, but the vision route model is unavailable: ${route.provider}/${route.model}`, "warning");
+      return;
+    }
+
+    if (!modelSupportsImages(model)) {
+      notify(ctx, `Image detected, but the configured vision model does not advertise image input: ${route.provider}/${route.model}`, "error");
+      return;
+    }
+
+    const ok = await applyRoute(ctx, pi, config, "vision");
+    if (!ok) return;
+    autoRestoreRoute = route.restore === false ? undefined : "vision";
+    notify(ctx, `Auto-routed image request to vision: ${route.provider}/${route.model}`, "info");
+  }
+
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension") return { action: "continue" };
+    await autoRouteImageRequest(ctx, event);
+    return { action: "continue" };
+  });
+
+  pi.on("before_agent_start", async (event, ctx) => {
+    await autoRouteImageRequest(ctx, event);
+  });
 
   pi.on("agent_end", async (_event, ctx) => {
     config = withConfig(ctx);
+    if (autoRestoreRoute) {
+      autoRestoreRoute = undefined;
+      await restoreRoute(ctx, pi, config);
+      return;
+    }
     if (!pendingModelReassert) return;
     const target = pendingModelReassert;
     pendingModelReassert = undefined;
@@ -235,6 +472,92 @@ export default function routingExtension(pi: ExtensionAPI) {
       }
 
       await showRouteSelector(ctx, pi, config);
+    },
+  });
+
+  pi.registerTool({
+    name: "task_delegate",
+    label: "Task Delegate",
+    description:
+      "Delegate a routed task to an internal focused subagent using the route's configured model, without changing the main session model.",
+    promptSnippet:
+      "Use task_delegate when a route-specific model should perform a concrete subtask now and return results, especially for search, review, oracle, or librarian work.",
+    promptGuidelines: [
+      "Prefer context='fresh' for cheap search/librarian/review tasks when the prompt includes enough detail.",
+      "Use context='fork' only when the child needs the current conversation context; forked context costs more.",
+      "Use task_delegate with task='vision' for immediate image/PDF/media analysis when a path is mentioned and the current model may not support images.",
+      "Use task_model switch only for changing the main session model; use task_delegate for immediate routed work.",
+    ],
+    parameters: Type.Object({
+      task: StringEnum(ROUTE_ORDER),
+      prompt: Type.String({ description: "The concrete task to give the delegated child agent." }),
+      agent: Type.Optional(Type.String({ description: "Override subagent name. Defaults by route: search=scout, review=reviewer, oracle=oracle, librarian=researcher, others=delegate." })),
+      context: Type.Optional(StringEnum(["fresh", "fork"] as const)),
+      cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Defaults to current cwd." })),
+    }),
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      config = withConfig(ctx);
+      const routingEnabled = config.enabled !== false;
+      if (!routingEnabled) throw new Error("Task routing is disabled.");
+
+      const task = params.task as RouteName;
+      if (!isRouteName(task)) {
+        throw new Error(`task is required. Use one of: ${ROUTE_ORDER.join(", ")}`);
+      }
+
+      const prompt = typeof params.prompt === "string" ? params.prompt.trim() : "";
+      if (!prompt) throw new Error("prompt is required for delegated route execution.");
+
+      const route = resolveRouteState(config, task);
+      if (!route.provider || !route.model) {
+        throw new Error(
+          `Route "${task}" is not configured with provider/model in settings. ${route.description}`,
+        );
+      }
+      const model = ctx.modelRegistry.find(route.provider, route.model);
+      if (!model) throw new Error(`Route "${task}" model is not available: ${route.provider}/${route.model}`);
+
+      const agent =
+        typeof params.agent === "string" && params.agent.trim()
+          ? params.agent.trim()
+          : defaultAgentForRoute(task);
+      const context = params.context === "fork" ? "fork" : "fresh";
+      const cwd = typeof params.cwd === "string" && params.cwd.trim() ? params.cwd.trim() : ctx.cwd;
+      const modelSpec = `${route.provider}/${route.model}`;
+      const thinking = route.thinkingLevel ?? highestThinkingLevel(model);
+      const delegatedPrompt = [
+        `[Routed task: ${task}]`,
+        `Use model route ${modelSpec} with thinking:${thinking}.`,
+        "Return concise, actionable results. Include file paths and commands when relevant.",
+        "",
+        prompt,
+      ].join("\n");
+
+      notify(ctx, `Delegating ${task} to internal ${agent} on ${modelSpec}`, "info");
+      const response = await runInternalSubagent(
+        ctx,
+        task,
+        {
+          agent,
+          task: delegatedPrompt,
+          context,
+          model: modelSpec,
+          cwd,
+          thinkingLevel: thinking,
+        },
+        signal,
+      );
+
+      const text = response.text;
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Delegated ${task} to internal ${agent} using ${modelSpec} (${context} context).\n\n${text}`,
+          },
+        ],
+        details: response,
+      };
     },
   });
 
