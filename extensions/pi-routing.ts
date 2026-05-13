@@ -136,6 +136,10 @@ async function runInternalSubagent(
     thinkingLevel: ModelThinkingLevel;
   },
   signal?: AbortSignal,
+  onUpdate?: (partialResult: {
+    content: Array<{ type: "text"; text: string }>;
+    details: Partial<InternalSubagentResponse> & { status?: string; turns?: number };
+  }) => void,
 ): Promise<InternalSubagentResponse> {
   const [provider, ...modelParts] = request.model.split("/");
   const modelId = modelParts.join("/");
@@ -166,24 +170,63 @@ async function runInternalSubagent(
   });
 
   let turns = 0;
+  let lastUpdateAt = 0;
+  let latestText = "";
+  const emitProgress = (status: string, force = false) => {
+    const now = Date.now();
+    if (!force && now - lastUpdateAt < 250) return;
+    lastUpdateAt = now;
+    if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent} · ${status}`);
+    onUpdate?.({
+      content: [
+        {
+          type: "text",
+          text: latestText
+            ? `Delegating ${routeName} to internal ${request.agent} (${status})...\n\n${latestText}`
+            : `Delegating ${routeName} to internal ${request.agent} (${status})...`,
+        },
+      ],
+      details: {
+        agent: request.agent,
+        task: request.task,
+        context: request.context,
+        model: request.model,
+        cwd: request.cwd,
+        status,
+        turns,
+      },
+    });
+  };
+
   const unsubscribe = agent.subscribe((event) => {
     if (event.type === "turn_start") {
       turns += 1;
-      if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent} · turn ${turns}`);
+      emitProgress(`turn ${turns}`, true);
+    } else if (event.type === "message_update") {
+      const text = extractTextFromDelegatedMessages([event.message]);
+      if (text) latestText = text;
+      emitProgress("responding");
     } else if (event.type === "tool_execution_start") {
-      if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent} · ${event.toolName}`);
+      emitProgress(event.toolName, true);
+    } else if (event.type === "tool_execution_end") {
+      emitProgress(`${event.toolName} done`, true);
     }
   });
 
+  const onAbort = () => agent.abort();
+  if (signal) {
+    if (signal.aborted) agent.abort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+
   try {
-    if (ctx.hasUI) ctx.ui.setStatus("route-delegate", `delegating to ${request.agent}`);
+    emitProgress("starting", true);
     await agent.prompt(request.task);
   } finally {
+    if (signal) signal.removeEventListener("abort", onAbort);
     unsubscribe();
     if (ctx.hasUI) ctx.ui.setStatus("route-delegate", undefined);
   }
-
-  if (signal?.aborted) agent.abort();
 
   const messages = agent.state.messages;
   const text = extractTextFromDelegatedMessages(messages) || "(no delegated output)";
@@ -483,7 +526,7 @@ export default function routingExtension(pi: ExtensionAPI) {
       context: Type.Optional(StringEnum(["fresh", "fork"] as const)),
       cwd: Type.Optional(Type.String({ description: "Working directory for the subagent. Defaults to current cwd." })),
     }),
-    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+    async execute(_toolCallId, params, signal, onUpdate, ctx) {
       config = withConfig(ctx);
       const routingEnabled = config.enabled !== false;
       if (!routingEnabled) throw new Error("Task routing is disabled.");
@@ -534,6 +577,7 @@ export default function routingExtension(pi: ExtensionAPI) {
           thinkingLevel: thinking,
         },
         signal,
+        onUpdate,
       );
 
       const text = response.text;
