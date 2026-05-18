@@ -1,25 +1,26 @@
 {
-  "name": "pi-routing",
+  "name": "pi-iuvate",
   "version": "1.0.0",
   "type": "module",
-  "description": "Lightweight named route switching for pi.",
+  "description": "Focused subagent delegation for pi.",
   "keywords": [
     "pi-package",
     "pi",
     "pi-extension",
-    "routing",
+    "iuvate",
+    "subagents",
     "model-switching",
     "coding-agent"
   ],
   "license": "MIT",
   "author": "ofrades",
-  "homepage": "https://github.com/ofrades/pi-routing#readme",
+  "homepage": "https://github.com/ofrades/pi-iuvate#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ofrades/pi-routing.git"
+    "url": "git+https://github.com/ofrades/pi-iuvate.git"
   },
   "bugs": {
-    "url": "https://github.com/ofrades/pi-routing/issues"
+    "url": "https://github.com/ofrades/pi-iuvate/issues"
   },
   "engines": {
     "node": ">=22"
@@ -29,7 +30,7 @@
   },
   "pi": {
     "extensions": [
-      "./extensions/pi-routing.ts"
+      "./extensions/pi-iuvate.ts"
     ]
   },
   "files": [
